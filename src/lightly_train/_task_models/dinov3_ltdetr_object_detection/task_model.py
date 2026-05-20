@@ -995,8 +995,7 @@ class DINOv3LTDETRObjectDetection(TaskModel):
             out:
                 Path where the ONNX model will be written.
             precision:
-                Precision for the ONNX model. Either "auto", "fp32", or "fp16". "auto"
-                uses the model's current precision.
+                Precision for the ONNX model. Either "auto", "fp32", or "fp16".
             batch_size:
                 Batch size for the ONNX input.
             dynamic_batch_size:
@@ -1031,7 +1030,6 @@ class DINOv3LTDETRObjectDetection(TaskModel):
 
         # Infer info from first parameter.
         model_device = first_parameter.device
-        dtype = first_parameter.dtype
 
         if precision == "fp32":
             dtype = torch.float32
@@ -1042,6 +1040,10 @@ class DINOv3LTDETRObjectDetection(TaskModel):
                 f"Invalid precision '{precision}'. Must be one of 'auto', 'fp32', 'fp16'."
             )
 
+        # Always trace in fp32 to avoid dtype mismatches in the decoder's
+        # autocast(enabled=False) blocks. fp16 conversion is applied
+        # post-export via onnxconverter_common.
+        dtype = torch.float32
         self.to(dtype)
         self.deploy()
         model_device = next(self.parameters()).device
@@ -1105,10 +1107,19 @@ class DINOv3LTDETRObjectDetection(TaskModel):
             **(format_args or {}),
         )
 
+
+        if precision == "fp16":
+            import onnx
+            from onnxruntime.transformers import float16 as ort_float16
+
+            model_onnx = onnx.load(str(out))
+            op_block_list = list(ort_float16.DEFAULT_OP_BLOCK_LIST) + ["Softmax", "MatMul"]
+            model_fp16 = ort_float16.convert_float_to_float16(model_onnx, op_block_list=op_block_list)
+            onnx.save(model_fp16, str(out))
+
         if simplify:
             import onnxslim  # type: ignore [import-not-found,import-untyped]
 
-            # Simplify.
             onnxslim.slim(
                 str(out),
                 output_model=out,
@@ -1119,7 +1130,9 @@ class DINOv3LTDETRObjectDetection(TaskModel):
             import onnx
             import onnxruntime as ort
 
-            onnx.checker.check_model(out, full_check=True)
+            # TODO we can run this if we are on a gpu
+            if precision != "fp16":
+                onnx.checker.check_model(out, full_check=True)
 
             # Always run the reference input in float32 and on cpu for consistency.
             reference_model = deepcopy(self).cpu().to(torch.float32).eval()
@@ -1128,8 +1141,10 @@ class DINOv3LTDETRObjectDetection(TaskModel):
                 dummy_input.cpu().to(torch.float32),
             )
 
-            # Get outputs from the ONNX model.
-            session = ort.InferenceSession(out)
+            # Get outputs from the ONNX model. Load from bytes to avoid
+            # ORT errors about missing external data when weights are inline.
+            with open(out, "rb") as f:
+                session = ort.InferenceSession(f.read())
             input_feed = {
                 "images": dummy_input.cpu().numpy(),
             }

@@ -11,8 +11,10 @@ import logging
 from copy import deepcopy
 from typing import Any, Literal
 
+import onnx
 import torch
 from PIL.Image import Image as PILImage
+from onnx import TensorProto
 from pydantic import Field
 from torch import Tensor
 from torchvision.transforms.v2 import functional as transforms_functional
@@ -965,6 +967,138 @@ class DINOv3LTDETRObjectDetection(TaskModel):
         x = self.decoder(feats=x, targets=targets)
         return x
 
+    @staticmethod
+    def make_output_names_unique(model: onnx.ModelProto) -> None:
+        """Rename duplicate node outputs to ensure uniqueness.
+
+        The onnxruntime float16 converter can create Cast nodes with duplicate
+        output names when the same tensor feeds multiple blocked operations.
+        This function renames such duplicates by appending a counter suffix
+        and updates consumer references accordingly.
+        """
+        graph = model.graph
+        nodes = list(graph.node)
+
+        # Map output name -> list of (node_index, output_slot_index)
+        output_producers: dict[str, list[tuple[int, int]]] = {}
+        for node_idx, node in enumerate(nodes):
+            for slot_idx, output in enumerate(node.output):
+                if output:
+                    output_producers.setdefault(output, []).append(
+                        (node_idx, slot_idx)
+                    )
+
+        # Process outputs with multiple producers
+        for output_name, producers in output_producers.items():
+            if len(producers) <= 1:
+                continue
+
+            # Keep first producer's output name, rename the rest
+            for i, (node_idx, slot_idx) in enumerate(producers):
+                if i == 0:
+                    continue  # Keep first producer unchanged
+
+                new_name = f"{output_name}_{i}"
+                nodes[node_idx].output[slot_idx] = new_name
+
+                # Find next producer's node_idx (or end of graph)
+                if i + 1 < len(producers):
+                    end_idx = producers[i + 1][0]
+                else:
+                    end_idx = len(nodes)
+
+                # Update consumers between this producer and the next producer
+                for consumer_idx in range(node_idx + 1, end_idx):
+                    consumer = nodes[consumer_idx]
+                    for j, inp in enumerate(consumer.input):
+                        if inp == output_name:
+                            consumer.input[j] = new_name
+
+    @staticmethod
+    def remove_redundant_casts(model_path, output_path):
+        model = onnx.load(model_path)
+        graph = model.graph
+
+        # Build a map of tensor name -> element type so we can verify
+        # that a Cast(to_fp16) actually receives FP32 input.
+        tensor_types: dict[str, int] = {}
+        for inp in graph.input:
+            if inp.type.HasField("tensor_type"):
+                tensor_types[inp.name] = inp.type.tensor_type.elem_type
+        for init in graph.initializer:
+            tensor_types[init.name] = init.data_type
+        for vi in graph.value_info:
+            if vi.type.HasField("tensor_type"):
+                tensor_types[vi.name] = vi.type.tensor_type.elem_type
+        for node in graph.node:
+            if node.op_type == "Cast":
+                to_attr = next(
+                    (a for a in node.attribute if a.name == "to"), None
+                )
+                if to_attr:
+                    tensor_types[node.output[0]] = to_attr.i
+
+        # Build a map: input_name -> list of consumer nodes
+        input_to_consumers: dict[str, list] = {}
+        for node in graph.node:
+            for inp in node.input:
+                input_to_consumers.setdefault(inp, []).append(node)
+
+        nodes_to_remove = set()
+        rewire = {}  # maps: cast_back_output -> original_input (bypassing both casts)
+
+        for node in graph.node:
+            if node.op_type != "Cast":
+                continue
+            # Check if this casts TO float16
+            to_attr = next((a for a in node.attribute if a.name == "to"), None)
+            if to_attr is None or to_attr.i != TensorProto.FLOAT16:
+                continue
+
+            # Only remove if the input is confirmed FP32. If the input is
+            # already FP16, removing the pair would feed an FP16 tensor into
+            # a node that expects FP32 (e.g. a blocked MatMul).
+            input_type = tensor_types.get(node.input[0])
+            if input_type != TensorProto.FLOAT:
+                continue
+
+            # Find all consumers of this node's output
+            consumers = input_to_consumers.get(node.output[0], [])
+            for consumer in consumers:
+                if consumer.op_type != "Cast":
+                    continue
+                to_attr2 = next((a for a in consumer.attribute if a.name == "to"), None)
+                if to_attr2 is None or to_attr2.i != TensorProto.FLOAT:
+                    continue
+
+                # Found a FP32->FP16->FP32 pair — mark for removal
+                # Only safe to remove the FP16 cast if it has no other consumers
+                if len(consumers) == 1:
+                    nodes_to_remove.add(id(node))
+                nodes_to_remove.add(id(consumer))
+                rewire[consumer.output[0]] = node.input[0]
+
+        # Rewire all references
+        for node in graph.node:
+            for i, inp in enumerate(node.input):
+                if inp in rewire:
+                    node.input[i] = rewire[inp]
+
+        # Also rewire graph outputs
+        for out in graph.output:
+            if out.name in rewire:
+                out.name = rewire[out.name]
+
+        # Remove marked nodes
+        new_nodes = [n for n in graph.node if id(n) not in nodes_to_remove]
+        del graph.node[:]
+        graph.node.extend(new_nodes)
+
+        onnx.save(model, output_path)
+        print(f"Removed {len(nodes_to_remove)} redundant Cast nodes")
+
+
+
     @torch.no_grad()
     def export_onnx(
         self,
@@ -1115,7 +1249,9 @@ class DINOv3LTDETRObjectDetection(TaskModel):
             model_onnx = onnx.load(str(out))
             op_block_list = list(ort_float16.DEFAULT_OP_BLOCK_LIST) + ["Softmax", "MatMul"]
             model_fp16 = ort_float16.convert_float_to_float16(model_onnx, op_block_list=op_block_list)
+            self.make_output_names_unique(model_fp16)
             onnx.save(model_fp16, str(out))
+            self.remove_redundant_casts(str(out), str(out))
 
         if simplify:
             import onnxslim  # type: ignore [import-not-found,import-untyped]
@@ -1145,8 +1281,11 @@ class DINOv3LTDETRObjectDetection(TaskModel):
             # ORT errors about missing external data when weights are inline.
             with open(out, "rb") as f:
                 session = ort.InferenceSession(f.read())
+            onnx_input = dummy_input.cpu()
+            if precision == "fp16":
+                onnx_input = onnx_input.half()
             input_feed = {
-                "images": dummy_input.cpu().numpy(),
+                "images": onnx_input.numpy(),
             }
             outputs_onnx = session.run(output_names=None, input_feed=input_feed)
             outputs_onnx = tuple(torch.from_numpy(y) for y in outputs_onnx)
@@ -1257,9 +1396,7 @@ class DINOv3LTDETRObjectDetection(TaskModel):
             max_batchsize=max_batchsize,
             opt_batchsize=opt_batchsize,
             min_batchsize=min_batchsize,
-            # FP32 attention scores required for FP16 model stability. Otherwise output
-            # contains NaN.
-            fp32_attention_scores=True,
+            fp32_attention_scores=False,
             verbose=verbose,
         )
 

@@ -1,4 +1,4 @@
-"""Export a dinov3_ltdetr_object_detection model to ONNX format."""
+"""Export a dinov3_ltdetr_object_detection model to ONNX or TensorRT format."""
 
 import argparse
 from pathlib import Path
@@ -16,7 +16,7 @@ from lightly_train._task_models.task_model_helpers import (
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Export a dinov3_ltdetr_object_detection model to ONNX."
+        description="Export a dinov3_ltdetr_object_detection model to ONNX or TensorRT."
     )
     parser.add_argument(
         "--model",
@@ -28,7 +28,14 @@ def main() -> None:
         "--out",
         type=Path,
         default=None,
-        help="Output path for the ONNX model. Defaults to '<decoder>_<precision>.onnx'.",
+        help="Output path. Defaults to '<decoder>_<precision>.<ext>'.",
+    )
+    parser.add_argument(
+        "--format",
+        type=str,
+        choices=["onnx", "tensorrt"],
+        default="onnx",
+        help="Export format: 'onnx' or 'tensorrt'.",
     )
     parser.add_argument(
         "--decoder",
@@ -42,7 +49,7 @@ def main() -> None:
         type=str,
         choices=["auto", "fp32", "fp16", "mixed"],
         default="fp32",
-        help="Precision for the ONNX model. 'mixed' keeps normalization and reduction ops in fp32.",
+        help="Precision for the exported model. 'mixed' keeps normalization and reduction ops in fp32.",
     )
     parser.add_argument(
         "--batch-size",
@@ -71,6 +78,29 @@ def main() -> None:
         action="store_true",
         help="Skip ONNX output verification.",
     )
+    parser.add_argument(
+        "--max-batch-size",
+        type=int,
+        default=1,
+        help="TensorRT: maximum supported batch size.",
+    )
+    parser.add_argument(
+        "--opt-batch-size",
+        type=int,
+        default=1,
+        help="TensorRT: batch size TensorRT optimizes for.",
+    )
+    parser.add_argument(
+        "--min-batch-size",
+        type=int,
+        default=1,
+        help="TensorRT: minimum supported batch size.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="TensorRT: enable verbose logging.",
+    )
     args = parser.parse_args()
 
     ckpt_path = download_checkpoint(checkpoint=args.model)
@@ -93,6 +123,11 @@ def main() -> None:
         model = init_model_from_checkpoint(checkpoint=ckpt)
     model.eval()
 
+    if args.format == "tensorrt":
+        ext = ".engine"
+    else:
+        ext = ".onnx"
+
     out = args.out
     if out is None:
         name = f"{decoder}_{args.precision}"
@@ -100,17 +135,36 @@ def main() -> None:
             name += f"_opset{args.opset}"
         if args.no_simplify:
             name += "_no_simplify"
-        out = Path(f"{name}.onnx")
+        out = Path(f"{name}{ext}")
 
-    model.export_onnx(
-        out=out,
-        precision=args.precision,
-        batch_size=args.batch_size,
-        dynamic_batch_size=args.dynamic_batch_size,
-        opset_version=args.opset,
-        simplify=not args.no_simplify,
-        verify=not args.no_verify,
-    )
+    if args.format == "tensorrt":
+        onnx_args = {
+            "precision": args.precision,
+            "batch_size": args.batch_size,
+            "dynamic_batch_size": args.dynamic_batch_size,
+            "opset_version": args.opset,
+            "simplify": not args.no_simplify,
+            "verify": not args.no_verify,
+        }
+        model.export_tensorrt(
+            out=out,
+            precision=args.precision,
+            onnx_args=onnx_args,
+            max_batchsize=args.max_batch_size,
+            opt_batchsize=args.opt_batch_size,
+            min_batchsize=args.min_batch_size,
+            verbose=args.verbose,
+        )
+    else:
+        model.export_onnx(
+            out=out,
+            precision=args.precision,
+            batch_size=args.batch_size,
+            dynamic_batch_size=args.dynamic_batch_size,
+            opset_version=args.opset,
+            simplify=not args.no_simplify,
+            verify=not args.no_verify,
+        )
 
 
 if __name__ == "__main__":
